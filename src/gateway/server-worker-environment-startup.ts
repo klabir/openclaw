@@ -297,13 +297,6 @@ export async function createGatewayWorkerEnvironmentRuntime(params: {
   const ensureNodeWorkerBundle = createGatewayNodeWorkerBundleInstaller({
     gatewayNamespace: nodeWorkerGatewayNamespace,
     getTransport: () => deviceRuntime.getNodeTransport(),
-    prepareBundle: async () => {
-      const artifact = await prepareInstallation("bundle");
-      if (artifact.install !== "bundle") {
-        throw new Error("Worker bundle preparation returned the wrong install channel");
-      }
-      return artifact;
-    },
     transfer: nodeWorkerBundleTransfer,
   });
   const nodeEnrollment = createWorkerNodeEnrollmentManager({
@@ -391,7 +384,7 @@ export async function createGatewayWorkerEnvironmentRuntime(params: {
         ? deviceRuntime.provider
         : resolveWorkerProvider(params.getPluginRegistry(), providerId),
     prepareInstallation,
-    ensureNodeWorkerBundle: async (deviceId) => await ensureNodeWorkerBundle({ deviceId }),
+    ensureNodeWorkerBundle,
     prepareNodeBootstrap: nodeEnrollment.prepare,
     prepareNodeEnrollment: nodeEnrollment.begin,
     prepareNodeRuntime: nodeEnrollment.prepareRuntime,
