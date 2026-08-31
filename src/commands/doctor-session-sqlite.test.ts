@@ -865,21 +865,7 @@ describe("runDoctorSessionSqlite", () => {
         mutate();
       }
     };
-    const sync = directoryDurability.syncDirectory;
-    const spy = vi
-      .spyOn(directoryDurability, "syncDirectory")
-      .mockImplementation(async (dir, opts) => {
-        const result = await sync(dir, opts);
-        mutateAfterSync(typeof dir === "string" ? dir : dir.path);
-        return result;
-      });
-    const fsync = fs.fsyncSync;
-    const syncSpy = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
-      fsync(fd);
-      if (isDirectoryDescriptor(fd, path.dirname(manifestPath))) {
-        mutateAfterSync(path.dirname(manifestPath));
-      }
-    });
+    const restoreSync = observeRecoveryDirectorySync(path.dirname(manifestPath), mutateAfterSync);
     try {
       const cleanup = retireSessionSqliteRecovery({
         env: store.env,
@@ -913,8 +899,7 @@ describe("runDoctorSessionSqlite", () => {
         expect(fs.readFileSync(retainedPath)).toEqual(originals[index]);
       }
     } finally {
-      spy.mockRestore();
-      syncSpy.mockRestore();
+      restoreSync();
       writer?.close();
     }
   });
@@ -982,21 +967,7 @@ describe("runDoctorSessionSqlite", () => {
           originals.set(move.archivePath, fs.readFileSync(file));
         }
       };
-      const sync = directoryDurability.syncDirectory;
-      const spy = vi
-        .spyOn(directoryDurability, "syncDirectory")
-        .mockImplementation(async (dir, opts) => {
-          const result = await sync(dir, opts);
-          mutateAfterSync(typeof dir === "string" ? dir : dir.path);
-          return result;
-        });
-      const fsync = fs.fsyncSync;
-      const syncSpy = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
-        fsync(fd);
-        if (isDirectoryDescriptor(fd, path.dirname(manifestPath))) {
-          mutateAfterSync(path.dirname(manifestPath));
-        }
-      });
+      const restoreSync = observeRecoveryDirectorySync(path.dirname(manifestPath), mutateAfterSync);
       const invoke = () =>
         retireSessionSqliteRecovery({
           env: store.env,
@@ -1010,8 +981,7 @@ describe("runDoctorSessionSqlite", () => {
         expect(result.status).toBe("blocked");
         expect(result.totals.removedFiles).toBe(0);
       } finally {
-        spy.mockRestore();
-        syncSpy.mockRestore();
+        restoreSync();
       }
       expect((await invoke()).totals.removedFiles).toBe(0);
       for (const move of readMigrationManifest(manifestPath).targets[0]!.completedMoves) {
@@ -3822,8 +3792,7 @@ describe("runDoctorSessionSqlite", () => {
   )(
     "preserves a late-created $destination during historical v$version restore without SQLite",
     async ({ version, destination }) => {
-      const { store, manifestPath, manifest, archivePath } =
-        await createHistoricalRestoreStore(version);
+      const { store, manifestPath, manifest, archivePath } = createHistoricalRestoreStore(version);
       const original = fs.readFileSync(archivePath);
       const sourcePath = expectDefined(
         manifest.targets
@@ -3902,6 +3871,161 @@ describe("runDoctorSessionSqlite", () => {
 
   it.each(
     ([1, 2] as const).flatMap((version) =>
+      (["transcript", "legacy-store"] as const).map((kind) => ({ version, kind })),
+    ),
+  )(
+    "rejects a changed historical v$version $kind before adopting restore metadata",
+    async ({ version, kind }) => {
+      const { store, manifestPath, manifest } = createHistoricalRestoreStore(version);
+      const target = expectDefined(manifest.targets[0], "historical restore target");
+      const move = expectDefined(
+        target.plannedMoves.find((candidate) => candidate.kind === kind),
+        "selected historical archive",
+      );
+      const original = fs.readFileSync(move.archivePath, "utf8");
+      const changed = original.replace('"session-1"', '"session-2"');
+      expect(changed).not.toBe(original);
+      expect(Buffer.byteLength(changed)).toBe(Buffer.byteLength(original));
+      const identity = fs.statSync(move.archivePath, { bigint: true });
+      const duplicate = { ...move, archivePath: `${move.archivePath}.duplicate` };
+      fs.copyFileSync(move.archivePath, duplicate.archivePath);
+      target.plannedMoves.push(duplicate);
+      target.completedMoves.push({ ...duplicate });
+      fs.writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`, { mode: 0o600 });
+
+      const close = fs.closeSync;
+      let injected = false;
+      const closeSpy = vi.spyOn(fs, "closeSync").mockImplementation((fd) => {
+        const opened = fs.fstatSync(fd, { bigint: true });
+        close(fd);
+        if (!injected && opened.dev === identity.dev && opened.ino === identity.ino) {
+          // Change real bytes after the planner closes its verified descriptor, before adoption.
+          injected = true;
+          fs.writeFileSync(move.archivePath, changed);
+        }
+      });
+      let result: Awaited<ReturnType<typeof runPublicSessionSqlite>>;
+      try {
+        result = await runPublicSessionSqlite(store, "restore");
+      } finally {
+        closeSpy.mockRestore();
+      }
+      expect(injected).toBe(true);
+      expect(result.exitCode).toBe(1);
+      expect(result.report.targets[0]?.restore?.conflicts).toEqual([
+        {
+          archivePath: move.archivePath,
+          sourcePath: move.sourcePath,
+          reason: "archive changed after restore planning; refusing restore",
+        },
+      ]);
+      expect(fs.existsSync(move.sourcePath)).toBe(false);
+      expect(fs.readFileSync(move.archivePath, "utf8")).toBe(changed);
+      expect(fs.statSync(move.archivePath, { bigint: true }).ino).toBe(identity.ino);
+      expect(fs.readFileSync(duplicate.archivePath, "utf8")).toBe(original);
+      const recorded = readMigrationManifest(manifestPath);
+      expect(recorded.restore?.consumedArchives ?? []).not.toContain(move.archivePath);
+      expect(recorded.restore?.restoredFiles ?? []).not.toContain(move.sourcePath);
+      const recordedTarget = expectDefined(recorded.targets[0], "recorded historical target");
+      for (const moves of [recordedTarget.plannedMoves, recordedTarget.completedMoves]) {
+        const recordedMove = expectDefined(
+          moves.find((item) => item.archivePath === move.archivePath),
+          "recorded historical original",
+        );
+        expect(recordedMove.artifact).toBeUndefined();
+      }
+      expect(fs.existsSync(target.sqlitePath)).toBe(false);
+    },
+  );
+
+  it.each(
+    ([1, 2] as const).flatMap((version) =>
+      (["restore", "recover"] as const).map((retryMode) => ({ version, retryMode })),
+    ),
+  )(
+    "retries historical v$version restored-directory edge sync through $retryMode",
+    async ({ version, retryMode }) => {
+      const { store, manifestPath, manifest } = createHistoricalRestoreStore(version);
+      const target = expectDefined(manifest.targets[0], "historical restore target");
+      const originals = target.plannedMoves.map((move) => ({
+        ...move,
+        bytes: fs.readFileSync(move.archivePath),
+        identity: fs.statSync(move.archivePath, { bigint: true }),
+      }));
+      if (retryMode === "recover") {
+        manifest.failedAt = manifest.startedAt;
+        fs.writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`, { mode: 0o600 });
+      }
+      fs.rmdirSync(store.sessionDir);
+      const sourceParent = path.dirname(store.sessionDir);
+      const assertOriginalsRetained = () => {
+        expect(readMigrationManifest(manifestPath).restore?.consumedArchives ?? []).toEqual([]);
+        for (const original of originals) {
+          expect(fs.readFileSync(original.archivePath)).toEqual(original.bytes);
+          expect(fs.statSync(original.archivePath, { bigint: true }).ino).toBe(
+            original.identity.ino,
+          );
+          if (fs.existsSync(original.sourcePath)) {
+            expect(fs.readFileSync(original.sourcePath)).toEqual(original.bytes);
+            expect(fs.statSync(original.sourcePath, { bigint: true }).ino).toBe(
+              original.identity.ino,
+            );
+          }
+        }
+        for (const file of resolveSqliteDatabaseFilePaths(target.sqlitePath)) {
+          expect(fs.existsSync(file)).toBe(false);
+        }
+      };
+      const fsync = fs.fsyncSync;
+      let edgeSyncAttempted = false;
+      const syncSpy = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+        if (isDirectoryDescriptor(fd, sourceParent)) {
+          edgeSyncAttempted = true;
+          throw Object.assign(new Error("injected restored-directory edge sync"), { code: "EIO" });
+        }
+        fsync(fd);
+      });
+      try {
+        const first = await runPublicSessionSqlite(store, "restore");
+        expect(edgeSyncAttempted).toBe(true);
+        expect(first.exitCode).toBe(1);
+        expect(first.report.targets[0]?.restore?.conflicts).toEqual(
+          expect.arrayContaining(
+            originals.map(({ archivePath, sourcePath }) =>
+              expect.objectContaining({ archivePath, sourcePath }),
+            ),
+          ),
+        );
+        expect(fs.statSync(store.sessionDir).isDirectory()).toBe(true);
+        assertOriginalsRetained();
+
+        edgeSyncAttempted = false;
+        await expect(runPublicSessionSqlite(store, retryMode)).rejects.toThrow(
+          "injected restored-directory edge sync",
+        );
+        expect(edgeSyncAttempted).toBe(true);
+        assertOriginalsRetained();
+      } finally {
+        syncSpy.mockRestore();
+      }
+      const resumed = await runPublicSessionSqlite(store, retryMode);
+      expect(resumed.report.targets[0]?.restore?.conflicts).toEqual([]);
+      const consumed = readMigrationManifest(manifestPath).restore?.consumedArchives;
+      expect(consumed).toHaveLength(originals.length);
+      expect(consumed).toEqual(expect.arrayContaining(originals.map((move) => move.archivePath)));
+      for (const original of originals) {
+        expect(fs.readFileSync(original.sourcePath)).toEqual(original.bytes);
+        expect(fs.statSync(original.sourcePath, { bigint: true }).ino).toBe(original.identity.ino);
+        expect(fs.existsSync(original.archivePath)).toBe(false);
+      }
+      for (const file of resolveSqliteDatabaseFilePaths(target.sqlitePath)) {
+        expect(fs.existsSync(file)).toBe(false);
+      }
+    },
+  );
+
+  it.each(
+    ([1, 2] as const).flatMap((version) =>
       (
         [
           { phase: "metadata-write", retryMode: "restore" },
@@ -3917,7 +4041,7 @@ describe("runDoctorSessionSqlite", () => {
   )(
     "resumes historical v$version index restore after $phase through $retryMode",
     async ({ version, phase, retryMode }) => {
-      const { store, manifestPath, manifest } = await createHistoricalRestoreStore(version);
+      const { store, manifestPath, manifest } = createHistoricalRestoreStore(version);
       const target = expectDefined(manifest.targets[0], "historical restore target");
       const index = expectDefined(
         target.plannedMoves.find((move) => move.kind === "legacy-store"),
@@ -4120,8 +4244,7 @@ describe("runDoctorSessionSqlite", () => {
   it.each([1, 2] as const)(
     "protects historical v%s restore metadata and its retained transcript dependency from cleanup",
     async (version) => {
-      const { store, manifestPath, manifest, archivePath } =
-        await createHistoricalRestoreStore(version);
+      const { store, manifestPath, manifest, archivePath } = createHistoricalRestoreStore(version);
       const target = expectDefined(manifest.targets[0], "historical cleanup target");
       const index = expectDefined(
         target.plannedMoves.find((move) => move.kind === "legacy-store"),
@@ -5485,20 +5608,63 @@ function createCanonicalCacheIndexDrift(sqlitePath: string): void {
   }
 }
 
-async function createHistoricalRestoreStore(version: 1 | 2) {
-  const { store, imported, archivePath } = await createVerifiedRecoveryStore();
-  const manifestPath = requireMigrationManifestPath(imported.migrationRun?.manifestPath);
-  const manifest = readMigrationManifest(manifestPath);
-  manifest.manifestVersion = version;
-  for (const target of manifest.targets) {
-    for (const move of [...target.plannedMoves, ...target.completedMoves]) {
-      delete move.artifact;
-    }
-    for (const file of resolveSqliteDatabaseFilePaths(target.sqlitePath)) {
-      fs.rmSync(file, { force: true });
-    }
-  }
+const RECOVERY_TRANSCRIPT_LINES = [
+  JSON.stringify({
+    type: "session",
+    id: "session-1",
+    version: 3,
+    timestamp: "2026-08-30T00:00:00Z",
+    cwd: "/fixture",
+  }),
+  JSON.stringify({
+    type: "message",
+    id: "one",
+    parentId: null,
+    message: { role: "user", content: "preserved history" },
+  }),
+];
+
+function createHistoricalRestoreStore(version: 1 | 2) {
+  const store = createLegacyStore({ transcriptLines: RECOVERY_TRANSCRIPT_LINES });
+  const archiveDir = path.join(path.dirname(store.sessionDir), "session-sqlite-import-archive");
+  const runsDir = path.join(store.stateDir, "session-sqlite-migration-runs");
+  fs.mkdirSync(archiveDir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(runsDir, { recursive: true, mode: 0o700 });
+  // Model the historical on-disk contract directly; the current importer is not fixture setup.
+  const moves = (
+    [
+      ["transcript", store.transcriptPath],
+      ["trajectory", store.trajectoryPath],
+      ["unreferenced-jsonl", store.unreferencedJsonlPath],
+      ["legacy-store", store.storePath],
+    ] as const
+  ).map(([kind, sourcePath]) => {
+    const archivePath = path.join(archiveDir, `${kind}.${path.basename(sourcePath)}.imported-1`);
+    fs.renameSync(sourcePath, archivePath);
+    return { kind, sourcePath, archivePath };
+  });
+  const manifest: SessionSqliteMigrationManifest = {
+    manifestVersion: version,
+    openClawVersion: "test",
+    runId: `historical-v${version}`,
+    startedAt: "2026-08-30T00:00:00.000Z",
+    completedAt: "2026-08-30T00:00:01.000Z",
+    targets: [
+      {
+        ...trustedMigrationTarget(store),
+        plannedMoves: moves,
+        completedMoves: structuredClone(moves),
+        issues: [],
+        validationBeforeArchive: "passed",
+      },
+    ],
+  };
+  const manifestPath = path.join(runsDir, `${manifest.runId}.json`);
   fs.writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`, { mode: 0o600 });
+  const archivePath = expectDefined(
+    moves.find((move) => move.kind === "transcript"),
+    "historical transcript archive",
+  ).archivePath;
   return { store, manifestPath, manifest, archivePath };
 }
 
@@ -5530,6 +5696,31 @@ async function runPublicSessionSqlite(store: TestStore, mode: "import" | "restor
   };
 }
 
+function observeRecoveryDirectorySync(
+  manifestDir: string,
+  onSynced: (directory: string) => void,
+): () => void {
+  const sync = directoryDurability.syncDirectory;
+  const asyncSpy = vi
+    .spyOn(directoryDurability, "syncDirectory")
+    .mockImplementation(async (directory, options) => {
+      const result = await sync(directory, options);
+      onSynced(typeof directory === "string" ? directory : directory.path);
+      return result;
+    });
+  const fsync = fs.fsyncSync;
+  const syncSpy = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+    fsync(fd);
+    if (isDirectoryDescriptor(fd, manifestDir)) {
+      onSynced(manifestDir);
+    }
+  });
+  return () => {
+    asyncSpy.mockRestore();
+    syncSpy.mockRestore();
+  };
+}
+
 function isDirectoryDescriptor(fd: number, directory: string): boolean {
   const opened = fs.fstatSync(fd);
   if (!opened.isDirectory()) {
@@ -5539,24 +5730,8 @@ function isDirectoryDescriptor(fd: number, directory: string): boolean {
   return opened.dev === expected.dev && opened.ino === expected.ino;
 }
 
-async function createVerifiedRecoveryStore(transcriptLines?: string[]) {
-  const store = createLegacyStore({
-    transcriptLines: transcriptLines ?? [
-      JSON.stringify({
-        type: "session",
-        id: "session-1",
-        version: 3,
-        timestamp: "2026-08-30T00:00:00Z",
-        cwd: "/fixture",
-      }),
-      JSON.stringify({
-        type: "message",
-        id: "one",
-        parentId: null,
-        message: { role: "user", content: "preserved history" },
-      }),
-    ],
-  });
+async function createVerifiedRecoveryStore(transcriptLines = RECOVERY_TRANSCRIPT_LINES) {
+  const store = createLegacyStore({ transcriptLines });
   const imported = await runDoctorSessionSqlite({
     env: store.env,
     mode: "import",

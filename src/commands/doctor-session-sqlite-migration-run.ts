@@ -2,11 +2,10 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { syncDirectorySync } from "@openclaw/fs-safe/durability";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { z } from "zod";
 import { resolveStateDir } from "../config/paths.js";
-import { requireDirectorySync } from "../infra/directory-durability.js";
+import { requireDirectorySync, syncDirectorySync } from "../infra/directory-durability.js";
 import * as replaceFile from "../infra/replace-file.js";
 import { VERSION } from "../version.js";
 import {

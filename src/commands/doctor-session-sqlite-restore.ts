@@ -5,6 +5,7 @@ import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { resolveStateDir } from "../config/paths.js";
 import { readFileDescriptorBoundedSync } from "../infra/boundary-file-read.js";
+import { requireDirectorySync, syncDirectorySync } from "../infra/directory-durability.js";
 import { isPathInside } from "../infra/path-guards.js";
 import { resolveSqliteDatabaseFilePaths } from "../infra/sqlite-files.js";
 import {
@@ -148,6 +149,12 @@ function recordRestoredMigrationMove(
   manifestPath: string,
   move: SessionSqliteMigrationMove,
 ): void {
+  // Sessions and archives are siblings. Retry their parent sync even when a previous
+  // attempt created the sessions directory, before consuming its original archive.
+  requireDirectorySync(
+    syncDirectorySync(path.dirname(path.dirname(move.sourcePath))),
+    "Restored session directory",
+  );
   // Commit consumption before unlinking the archive, so an interrupted restore cannot
   // make a settled generation look like unexplained missing history.
   const consumed = collectRecordedConsumedArchives(manifest);
@@ -640,28 +647,25 @@ async function restoreMigrationMove(params: {
     return;
   }
   try {
-    if (planned.action === "restore") {
-      const inspection = inspectRestoreArchive(move);
-      if (
-        inspection.state !== "available" ||
-        inspection.snapshot.digest !== planned.snapshot.digest ||
-        inspection.snapshot.size !== planned.snapshot.size ||
-        inspection.snapshot.legacyEntryCount !== planned.snapshot.legacyEntryCount
-      ) {
-        throw new Error("archive changed after restore planning; refusing restore");
-      }
-    }
     if (!isRegularFileWithoutFollowingSymlinks(move.archivePath)) {
       throw new Error("archive is not a regular file; refusing restore");
     }
     assertRestoreDirectories(move);
     fs.mkdirSync(path.dirname(move.sourcePath), { recursive: true, mode: 0o700 });
     assertRestoreDirectories(move);
+    const identity = move.artifact?.identity ?? readMigrationArtifactIdentity(move.archivePath);
+    // Publication rechecks these exact bytes; matching the plan also preserves its index count.
+    if (
+      planned.action === "restore" &&
+      (identity.sha256 !== planned.snapshot.digest || identity.size !== planned.snapshot.size)
+    ) {
+      throw new Error("archive changed after restore planning; refusing restore");
+    }
     if (!move.artifact) {
       // Historical manifests need an identity before the first link so a crash is retryable.
       // This proves the original's identity, not its import; cleanup must keep it protected.
       move.artifact = {
-        identity: readMigrationArtifactIdentity(move.archivePath),
+        identity,
         classification: "protected",
         reason: "historical-restore-original",
         dependencies:
@@ -709,9 +713,6 @@ function resolveRestoreStatus(
   }
   if (report.restoredFiles.length > 0) {
     return "restored";
-  }
-  if (report.skippedFiles.length > 0) {
-    return "noop";
   }
   return "noop";
 }
