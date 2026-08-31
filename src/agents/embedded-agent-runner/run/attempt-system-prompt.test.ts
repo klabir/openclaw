@@ -139,7 +139,8 @@ describe("buildAttemptSystemPrompt", () => {
         effectiveCwd: workspaceDir,
         effectiveTools: [],
         effectiveWorkspace: workspaceDir,
-        getProviderRuntimeHandle: () => ({ provider: "openai" }),
+        // Prepared handles include the model; omitting it starts cold provider discovery.
+        getProviderRuntimeHandle: () => ({ provider: "openai", modelId: "gpt-5.5" }),
         isRawModelRun: true,
         markStage: vi.fn(),
         modelToolsEnabled: false,
