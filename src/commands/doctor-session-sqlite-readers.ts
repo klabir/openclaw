@@ -88,16 +88,17 @@ export function createTranscriptEventReader(
   sessionId: string,
   allowMalformedPrefix = false,
   sourceFingerprint = readTranscriptFingerprint(transcriptPath),
+  originalSourcePath = transcriptPath,
 ): (append: (event: TranscriptEvent) => void) => () => void {
   return (append) => {
     // Production import owns the process-wide Gateway/SQLite-maintenance lock
     // through commit and archive. Fingerprints catch non-cooperating external edits.
     const plan = planTranscriptImport(transcriptPath, allowMalformedPrefix);
     assertTranscriptFileUnchanged(transcriptPath, sourceFingerprint);
-    // V1 compactions refer to original row indexes. Stable index-derived IDs let
-    // the second pass resolve those links without retaining the transcript.
+    // V1 compactions refer to original row indexes. Hash the original source path
+    // so archive verification reproduces import IDs without retaining the transcript.
     const idPrefix = createHash("sha256")
-      .update(transcriptPath)
+      .update(originalSourcePath)
       .update("\0")
       .update(sessionId)
       .digest("hex")

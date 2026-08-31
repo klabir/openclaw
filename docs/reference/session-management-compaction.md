@@ -79,26 +79,40 @@ Normal Gateway writes flow through the session accessor, which serializes per-ag
 
 OpenClaw no longer creates automatic `sessions.json.bak.*` rotation backups during Gateway writes. The current schema rejects the legacy `session.maintenance.rotateBytes` key, and `openclaw doctor --fix` removes it from older configs.
 
+Migration recovery originals and exact pre-Doctor recovery files are separate
+from ordinary session retention: they are excluded from the live session disk
+budget and have no automatic expiration. After verifying the upgrade, use
+`openclaw update cleanup --dry-run` to inspect them online. Explicit offline
+[update cleanup](/cli/update#update-cleanup) can retire verified originals
+without removing current SQLite history; exclusion from the disk budget is not
+deletion authority.
+
 Transcript mutations pass through the session accessor and SQLite writer queue.
 Each mutation verifies the active run's durable writer claim inside its commit
 transaction, so a superseded run cannot write to the transcript.
 
 ### Downgrading After The SQLite Flip
 
-Restore archived legacy transcript artifacts before running an older
-file-backed OpenClaw version:
+Stop the Gateway, then use the current CLI to restore archived legacy transcript
+artifacts before running an older file-backed OpenClaw version:
 
 ```bash
 openclaw doctor --session-sqlite restore --session-sqlite-all-agents
 ```
 
-The migration leaves legacy `sessions.json` files in place for support and
-rollback, but hot transcript JSONL files that were imported into SQLite are
-renamed into `session-sqlite-import-archive/`. Older file-backed runtimes follow
+Successful migration archives legacy `sessions.json` indexes and imported hot
+transcript JSONL files in `session-sqlite-import-archive/`. Migration manifests
+retain their original path mappings for support and rollback. Older file-backed runtimes follow
 the `sessionFile` paths in `sessions.json`, so they need those artifacts restored
 before startup. Restore uses migration manifests, moves only recorded archived
 artifacts whose original paths are missing, and leaves the SQLite database in
 place for forward recovery.
+
+Originals retired by `openclaw update cleanup` can no longer be restored from
+the migration archive. Restore reports intentional disposal or pending cleanup
+instead of treating either as an unexpectedly missing file. An independent
+backup containing the legacy artifacts is required if you need them after
+disposal; see [Pre-update backups](/install/updating#before-updating-create-a-verified-backup).
 
 Sessions created after the SQLite flip are SQLite-only and will not appear to an
 older file-backed runtime. If you re-upgrade after a downgrade, run the Doctor

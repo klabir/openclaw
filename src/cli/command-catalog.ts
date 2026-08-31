@@ -580,6 +580,17 @@ export const cliCommandCatalog: readonly CliCommandCatalogEntry[] = [
   { commandPath: ["tui"], policy: { networkProxy: "bypass" } },
   { commandPath: ["uninstall"], policy: { networkProxy: "bypass" } },
   {
+    commandPath: ["update", "cleanup"],
+    exact: true,
+    policy: {
+      configGuard: "skip",
+      hideBanner: true,
+      ensureCliPath: false,
+      loadPlugins: "never",
+      networkProxy: "bypass",
+    },
+  },
+  {
     commandPath: ["update"],
     policy: {
       configGuard: "skip",
