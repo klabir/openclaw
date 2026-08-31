@@ -2,9 +2,11 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { syncDirectorySync } from "@openclaw/fs-safe/durability";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { z } from "zod";
 import { resolveStateDir } from "../config/paths.js";
+import { requireDirectorySync } from "../infra/directory-durability.js";
 import * as replaceFile from "../infra/replace-file.js";
 import { VERSION } from "../version.js";
 import {
@@ -239,8 +241,13 @@ export function writeSessionSqliteMigrationManifest(
     tempPrefix: path.basename(activeRun.manifestPath),
     copyFallbackOnPermissionError: false,
     syncTempFile: true,
-    syncParentDir: true,
   });
+  // Atomic replacement only offers best-effort parent sync. Recovery receipts must be
+  // durable before their recorded original can be published, consumed, or retired.
+  requireDirectorySync(
+    syncDirectorySync(path.dirname(activeRun.manifestPath)),
+    "Session SQLite migration manifest",
+  );
 }
 
 export function updateMigrationManifestTarget(

@@ -436,8 +436,13 @@ it writes the local support report and prints a prefilled issue URL.
 
 `restore` remains the lower-level undo operation. It uses manifest
 `sourcePath -> archivePath` records, moves archived artifacts back only when the
-original path is missing, reports conflicts when both paths exist, and leaves
-the SQLite database in place. When several manifests recorded the same original
+original path is missing, reports conflicts for independently existing originals,
+and leaves the SQLite database in place. Publication is exclusive: a file or
+symbolic link created during verification is not replaced. Restore moves the
+original without copying its contents, and fails without consuming the archive
+if the filesystem cannot publish it safely. Recorded interrupted publications
+can be retried, including with older manifests or after the replacement SQLite
+database has been removed. When several manifests recorded the same original
 path, restore plans all candidates before moving any of them. Identical archives
 are safe duplicates, and one nonempty legacy `sessions.json` may supersede empty
 copies created by older writers. Distinct nonempty indexes, distinct transcript
