@@ -1,5 +1,5 @@
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
-import { chatMessagesContainQueuedSend } from "../../pages/chat/chat-send-support.ts";
+import { findChatSubmissionMessage } from "../chat/history-message-identity.ts";
 import { formatUiError } from "../format-error.ts";
 import { isUiGlobalSessionKey } from "./session-key.ts";
 import {
@@ -65,18 +65,7 @@ export async function advanceSessionPlacementDraft(params: {
     if (!isCurrentOwner()) {
       return { status: "interrupted" };
     }
-    if (
-      chatMessagesContainQueuedSend(
-        history.messages,
-        {
-          id: recovery.messageId,
-          text: recovery.message,
-          createdAt: Date.now(),
-          sendRunId: recovery.messageId,
-        },
-        true,
-      )
-    ) {
+    if (findChatSubmissionMessage(history.messages, recovery.messageId, true)) {
       params.clearRecovery("resolved");
       return { status: "started", messageId: recovery.messageId };
     }

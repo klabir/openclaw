@@ -1,4 +1,32 @@
+import { readSessionMessageIdentity } from "@openclaw/gateway-client/browser";
 import { asNullableRecord } from "@openclaw/normalization-core/record-coerce";
+
+/** Submission proof uses the recorded key, never execution correlation. */
+export function findChatSubmissionMessage(
+  messages: unknown,
+  runId: string | undefined,
+  userRoleOnly = false,
+) {
+  let match = null;
+  if (!runId || !Array.isArray(messages)) {
+    return match;
+  }
+  for (const message of messages) {
+    const identity = readSessionMessageIdentity(message);
+    if (
+      identity &&
+      (!userRoleOnly || identity.role === "user") &&
+      (identity.idempotencyKey === runId || identity.idempotencyKey === `${runId}:user`)
+    ) {
+      match = identity;
+      // A durable user receipt supersedes a local display copy in the same batch.
+      if (identity.id !== null || identity.sequence !== null) {
+        return identity;
+      }
+    }
+  }
+  return match;
+}
 
 export function nativeHistoryMessageIdentity(message: unknown): string | null {
   const record = asNullableRecord(message);

@@ -4,7 +4,7 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChatPendingInputsPage } from "../../../../packages/gateway-protocol/src/schema/logs-chat.js";
 import { createDeferred } from "../../../../test/helpers/promise.js";
-import { createInitialUserMessageHandoff } from "../../app/initial-user-message-handoff.ts";
+import { createChatSubmissions } from "../../app/chat-submissions.ts";
 import type { ChatQueueItem } from "../../lib/chat/chat-types.ts";
 import * as outboxPayloadStore from "../../lib/chat/outbox-payload-store.runtime.ts";
 import {
@@ -31,15 +31,18 @@ import { resetChatThreadState } from "./chat-thread.ts";
 import { extractImages } from "./components/chat-message-media.ts";
 import { listStoredChatOutboxes, loadChatComposerSnapshot } from "./composer-persistence.ts";
 import {
-  admitInitialUserMessageHandoff,
+  admitChatSubmission,
   reduceChatSessionProjection,
   getChatSessionProjection,
 } from "./history-merge.ts";
-import { prepareInitialUserMessageHandoff } from "./initial-turn-handoff.ts";
 import { installOutboxBrowserStorage } from "./outbox-browser.test-support.ts";
 import { prepareOutboxPayload } from "./outbox-payloads.ts";
-import { cacheChatSessionSnapshot, type ChatMessageCache } from "./session-message-cache.ts";
-import { buildLocalUserMessage } from "./user-message-content.ts";
+import {
+  applyChatCacheSnapshot,
+  cacheChatSessionSnapshot,
+  type ChatMessageCache,
+} from "./session-message-cache.ts";
+import { buildInitialChatSubmission, buildLocalUserMessage } from "./user-message-content.ts";
 
 const sessionKey = "agent:main:accepted-inputs";
 const sessionId = "accepted-input-session";
@@ -59,7 +62,7 @@ const page: ChatPendingInputsPage = { items: [input], total: 2, nextBefore: 2 };
 async function retainDeliveredUserTurn(
   host: Parameters<typeof retireDeliveredQueuedUserTurn>[0],
   item: ChatQueueItem,
-): Promise<void> {
+): Promise<Parameters<typeof retireDeliveredQueuedUserTurn>[2]> {
   const admission = captureChatOutboxAdmission(
     host,
     item.sessionKey ?? host.sessionKey,
@@ -73,6 +76,7 @@ async function retainDeliveredUserTurn(
     "admitted provisional source",
   );
   expect(await retireDeliveredQueuedUserTurn(host, item.sendRunId, outbox)).toBe("retired");
+  return outbox;
 }
 
 function makeChatPageHost({
@@ -100,6 +104,72 @@ afterEach(() => {
 });
 
 describe("server-owned pending input display", () => {
+  it("keeps cached local submissions available after pane remount", async () => {
+    const host = makeChatHost({ sessionKey, currentSessionId: sessionId, requestHandlers: {} });
+    const runId = "cached-delivery";
+    const scope = await retainDeliveredUserTurn(host, {
+      id: runId,
+      sendRunId: runId,
+      sessionKey,
+      sessionId,
+      text: "Pending persistence",
+      createdAt: 1,
+    });
+    applyChatCacheSnapshot(host, {
+      messages: host.chatMessages,
+      sessionId,
+      pagination: { hasMore: false },
+    });
+    const remounted = makeChatHost({ sessionKey, currentSessionId: sessionId });
+    remounted.client = host.client;
+    remounted.chatSubmissions = host.chatSubmissions;
+
+    expect(await retireDeliveredQueuedUserTurn(remounted, runId, scope)).toBe("retired");
+    expect(remounted.chatMessages).toEqual(host.chatMessages);
+    expect(remounted.chatMessages).toHaveLength(1);
+  });
+
+  it.each(["consumed", "canonical", "canonical-first"])(
+    "keeps a %s delivered source retired when its terminal is replayed",
+    async (receipt) => {
+      const host = makeChatHost({ sessionKey, currentSessionId: sessionId });
+      const runId = "consumed-delivery";
+      const canonical = {
+        role: "user",
+        content: "Authoritative input",
+        __openclaw: { id: "canonical-input", seq: 1, idempotencyKey: `${runId}:user` },
+      };
+      if (receipt === "canonical-first") {
+        reduceChatSessionProjection(host, { type: "snapshotLoaded", messages: [canonical] });
+      }
+      const scope = await retainDeliveredUserTurn(host, {
+        id: runId,
+        sendRunId: runId,
+        sessionKey,
+        sessionId,
+        text: "Collected input",
+        createdAt: 1,
+      });
+      if (receipt === "consumed") {
+        applyChatPendingInputs(
+          host,
+          { items: [], total: 0 },
+          { consumptions: [{ runId, consumedByEventId: "aggregate" }] },
+        );
+      } else {
+        if (receipt === "canonical") {
+          reduceChatSessionProjection(host, { type: "snapshotLoaded", messages: [canonical] });
+        }
+        expect(host.chatMessages).toEqual([canonical]);
+        reduceChatSessionProjection(host, { type: "snapshotLoaded", messages: [] });
+      }
+      expect(host.chatMessages).toEqual([]);
+      expect(await retireDeliveredQueuedUserTurn(host, runId, scope)).toBe("retired");
+      expect(host.chatMessages).toEqual([]);
+      expect(listStoredChatOutboxes(host)).toEqual([]);
+    },
+  );
+
   it("does not share consumption queries between panes with different provisional sources", async () => {
     const response = createDeferred<unknown>();
     const first = makeChatHost({
@@ -303,7 +373,7 @@ describe("server-owned pending input display", () => {
             ]
           : undefined;
       const history = source === "initial" ? [] : [canonical];
-      const initialUserMessage = createInitialUserMessageHandoff();
+      const chatSubmissions = createChatSubmissions();
       const tool = { role: "assistant", toolCallId: "active-tool", runId: "active-run" };
       const cache: ChatMessageCache = new Map();
       const host = makeChatHost({
@@ -313,7 +383,7 @@ describe("server-owned pending input display", () => {
         chatStream: "Still working",
         chatToolMessages: [tool],
         chatMessages: history,
-        initialUserMessage,
+        chatSubmissions,
         chatHistoryPagination: { hasMore: false, completeSnapshot: true },
         chatMessagesBySession: cache,
         requestHandlers: {
@@ -348,24 +418,24 @@ describe("server-owned pending input display", () => {
           replyToId: "reply-target",
         };
         if (source === "initial" && sendRunId === input.runId) {
-          const identity = { runId: sendRunId, messageSeq: 1 };
-          prepareInitialUserMessageHandoff(
-            initialUserMessage,
-            sessionKey,
-            {
-              ...item,
-              attachments: [
-                {
-                  id: "initial-image",
-                  mimeType: "image/png",
-                  dataUrl: "data:image/png;base64,iVBORw0KGgo=",
-                },
-              ],
-            },
-            host.client!,
-            identity,
+          chatSubmissions.retain(
+            buildInitialChatSubmission(
+              sessionKey,
+              {
+                ...item,
+                attachments: [
+                  {
+                    id: "initial-image",
+                    mimeType: "image/png",
+                    dataUrl: "data:image/png;base64,iVBORw0KGgo=",
+                  },
+                ],
+              },
+              host.client!,
+              sendRunId,
+            ),
           );
-          admitInitialUserMessageHandoff(host, sessionKey);
+          admitChatSubmission(host);
         } else {
           await retainDeliveredUserTurn(host, item);
         }
@@ -379,10 +449,7 @@ describe("server-owned pending input display", () => {
         expect(getChatHistoryLoadState(host).phase).toBe("committed");
       }
       expect(host.chatMessages).toEqual([...history, unrelated]);
-      expect(getChatSessionProjection(host, host.chatMessages).messages).toEqual([
-        ...history,
-        unrelated,
-      ]);
+      expect(getChatSessionProjection(host).messages).toEqual([...history, unrelated]);
       expect(host.chatRunId).toBe("active-run");
       expect(host.chatStream).toBe("Still working");
       expect(host.chatToolMessages).toEqual([tool]);
@@ -420,14 +487,14 @@ describe("server-owned pending input display", () => {
         { type: "snapshotLoaded", messages: history },
         { runActive: true },
       );
-      expect(admitInitialUserMessageHandoff(host, sessionKey)).toBe(false);
+      expect(admitChatSubmission(host)).toBe(false);
       const remounted = makeChatHost({
         sessionKey,
         currentSessionId: sessionId,
         client: host.client,
-        initialUserMessage,
+        chatSubmissions,
       });
-      expect(admitInitialUserMessageHandoff(remounted, sessionKey)).toBe(false);
+      expect(admitChatSubmission(remounted)).toBe(false);
       expect(remounted.chatMessages).toEqual([]);
       // Retirement still permits display adoption, but only for the exact source.
       const otherInputs = ["other-accepted-source", undefined].map((runId) => ({
@@ -451,7 +518,7 @@ describe("server-owned pending input display", () => {
       applyChatPendingInputs(host, { items: [], total: 0 });
       expect(host.chatMessages).toEqual([...history, unrelated]);
       if (source === "initial" && custody !== "consumed") {
-        const localContent = initialUserMessage.read(sessionKey, host.client)!.message.content;
+        const localContent = chatSubmissions.readInitial(sessionKey, host.client)!.message.content;
         const promoted = {
           role: "user",
           content: "authoritative projection",
@@ -474,7 +541,7 @@ describe("server-owned pending input display", () => {
             senderName: "Authoritative Author",
           },
         });
-        expect(admitInitialUserMessageHandoff(host, sessionKey)).toBe(false);
+        expect(admitChatSubmission(host)).toBe(false);
       }
     },
   );

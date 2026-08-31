@@ -682,7 +682,7 @@ describe("handleSendChat session ownership", () => {
       });
       await loadChatHistory(host);
       expect(host.chatRunError?.summary).toContain(failed.sessionInfo!.lastRunError);
-      const diagnostic = getChatSessionProjection(host, host.chatMessages).runs["run-first"];
+      const diagnostic = getChatSessionProjection(host).runs["run-first"];
       const loading = pendingHistory ? loadChatHistory(host) : undefined;
       try {
         const sending = handleSendChat(
@@ -714,9 +714,7 @@ describe("handleSendChat session ownership", () => {
         expect(host.chatRunStatus).toMatchObject({ phase: "done", runId });
         expect(host.chatRunId).toBeNull();
         expect(host.lastError).toBeNull();
-        expect(getChatSessionProjection(host, host.chatMessages).runs["run-first"]).toEqual(
-          diagnostic,
-        );
+        expect(getChatSessionProjection(host).runs["run-first"]).toEqual(diagnostic);
         expect(host.chatRunError).toBeNull();
       } finally {
         reconcileChatRunLifecycle(host, { clearRunStatus: true });
@@ -803,7 +801,7 @@ describe("handleSendChat session ownership", () => {
         await loadChatHistory(host);
         expect(host.chatRunId).toBeNull();
         expect(host.chatRunError).toBeNull();
-        expect(getChatSessionProjection(host, host.chatMessages).runs["old-run"]).toBeUndefined();
+        expect(getChatSessionProjection(host).runs["old-run"]).toBeUndefined();
       } finally {
         ack.resolve({ status: "started" });
         await sending;
