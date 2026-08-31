@@ -7,10 +7,9 @@ import {
   inferSignalStatus,
   isExactUnknownNoDetailsError,
 } from "../failover/classification-rules.js";
-import { classifyFailoverReason, classifyFailoverSignal } from "../failover/classify.js";
-import { isContextOverflowErrorFromTables } from "../failover/context-overflow.js";
-import { matchesFormatErrorPattern, isTimeoutErrorMessage } from "../failover/message-patterns.js";
-import type { FailoverSignal } from "../failover/signal.js";
+import { classifyFailoverSignal } from "../failover/classify.js";
+import { isTimeoutErrorMessage } from "../failover/message-patterns.js";
+import type { FailoverClassification, FailoverSignal } from "../failover/signal.js";
 export type ProviderRuntimeFailureKind =
   | "auth_scope"
   | "auth_refresh"
@@ -130,12 +129,6 @@ function isThinkingSignatureReplayInvalidErrorMessage(raw: string): boolean {
 function isSandboxBlockedErrorMessage(raw: string): boolean {
   return Boolean(formatExecDeniedUserMessage(raw)) || SANDBOX_BLOCKED_RE.test(raw);
 }
-function isSchemaErrorMessage(raw: string): boolean {
-  if (!raw || isReplayInvalidErrorMessage(raw) || isContextOverflowErrorFromTables(raw)) {
-    return false;
-  }
-  return classifyFailoverReason(raw) === "format" || matchesFormatErrorPattern(raw);
-}
 function isTimeoutTransportErrorMessage(raw: string, status?: number): boolean {
   if (!raw) {
     return false;
@@ -169,6 +162,7 @@ function isOAuthCallbackValidationMessage(raw: string): boolean {
 }
 export function classifyProviderRuntimeFailureKind(
   signal: FailoverSignal | string,
+  classification?: FailoverClassification | null,
 ): ProviderRuntimeFailureKind {
   const normalizedSignal = typeof signal === "string" ? { message: signal } : signal;
   const message = normalizedSignal.message?.trim() ?? "";
@@ -211,11 +205,12 @@ export function classifyProviderRuntimeFailureKind(
     }
     return status === 401 || status === 403 ? "auth_html" : "upstream_html";
   }
-  const failoverClassification = classifyFailoverSignal({
-    ...normalizedSignal,
-    status,
-    message: message || undefined,
-  });
+  // Diagnostics must not discover providers. Presentation can reuse the full
+  // classification from its prepared owner, including an unclassified null.
+  const failoverClassification =
+    classification === undefined
+      ? classifyFailoverSignal(normalizedSignal, { providerPlugin: null })
+      : classification;
   const failoverReason =
     failoverClassification?.kind === "reason" ? failoverClassification.reason : undefined;
   switch (failoverReason) {
@@ -235,7 +230,7 @@ export function classifyProviderRuntimeFailureKind(
   if (message && isReplayInvalidErrorMessage(message)) {
     return "replay_invalid";
   }
-  if (message && isSchemaErrorMessage(message)) {
+  if (failoverReason === "format") {
     return "schema";
   }
   // Plain HTTP 401 / invalid-token replies should be safe chat copy, but the
