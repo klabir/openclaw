@@ -559,6 +559,7 @@ export function createWorkerEnvironmentService(options: WorkerEnvironmentService
       machineClass?: string,
       executionMode?: WorkerExecutionMode,
       projectPath?: string,
+      signal?: AbortSignal,
     ) => {
       if (executionMode) {
         requireProviderExecutionMode(configuredProfileProviderId(profileId), executionMode);
@@ -568,6 +569,7 @@ export function createWorkerEnvironmentService(options: WorkerEnvironmentService
           machineClass,
           executionMode,
           projectPath,
+          signal,
         }),
       );
     },
@@ -577,6 +579,7 @@ export function createWorkerEnvironmentService(options: WorkerEnvironmentService
       machineClass?: string,
       executionMode?: WorkerExecutionMode,
       projectPath?: string,
+      signal?: AbortSignal,
     ) => {
       requireProviderExecutionMode(profile.providerId, executionMode);
       return environmentAccess.project(
@@ -588,6 +591,7 @@ export function createWorkerEnvironmentService(options: WorkerEnvironmentService
           machineClass,
           executionMode,
           projectPath,
+          signal,
         }),
       );
     },

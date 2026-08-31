@@ -319,6 +319,7 @@ export function createCrabboxWarmImageManager(dependencies: {
           await deleteImage(context, key, observed);
         }
       } catch (error) {
+        assertCurrent(context);
         available = false;
         warnOnce("verification", error);
       }
