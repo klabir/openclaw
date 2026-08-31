@@ -7,7 +7,9 @@ import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { writePackageDistInventory } from "../../scripts/lib/package-dist-inventory.ts";
+import { PACKAGE_LIFECYCLE_PENDING_RELATIVE_PATH } from "../../scripts/lib/package-lifecycle-marker.mjs";
 import {
+  completePackageLifecycle,
   isSourceCheckoutRoot,
   isDirectPostinstallInvocation,
   MAX_INSTALLED_DIST_SCAN_ENTRIES,
@@ -41,6 +43,35 @@ describe("bundled plugin postinstall", () => {
     ).toBe(true);
   });
 
+  it("removes the lifecycle marker only after postinstall completion", () => {
+    const rmSync = vi.fn();
+
+    expect(completePackageLifecycle({ packageRoot: "/pkg", rmSync })).toBe(true);
+    expect(rmSync).toHaveBeenCalledWith(
+      path.join("/pkg", PACKAGE_LIFECYCLE_PENDING_RELATIVE_PATH),
+      { force: true },
+    );
+  });
+
+  it("fails lifecycle completion when its marker cannot be removed", () => {
+    const reportError = vi.fn();
+
+    expect(
+      completePackageLifecycle(
+        {
+          packageRoot: "/pkg",
+          rmSync: () => {
+            throw new Error("read-only package");
+          },
+        },
+        reportError,
+      ),
+    ).toBe(false);
+    expect(reportError).toHaveBeenCalledWith(
+      expect.stringContaining("could not complete package lifecycle: Error: read-only package"),
+    );
+  });
+
   it.each([
     { cacheMode: "disabled", disableCompileCache: "1" },
     { cacheMode: "enabled", disableCompileCache: undefined },
@@ -68,6 +99,10 @@ describe("bundled plugin postinstall", () => {
       await fs.copyFile(
         fileURLToPath(new URL("../../scripts/postinstall-bundled-plugins.mjs", import.meta.url)),
         path.join(scriptRoot, "postinstall-bundled-plugins.mjs"),
+      );
+      await fs.copyFile(
+        fileURLToPath(new URL("../../scripts/lib/package-lifecycle-marker.mjs", import.meta.url)),
+        path.join(scriptRoot, "lib", "package-lifecycle-marker.mjs"),
       );
       for (const sentinel of sentinels) {
         await fs.mkdir(path.dirname(sentinel), { recursive: true });
@@ -128,10 +163,14 @@ describe("bundled plugin postinstall", () => {
       const packageRoot = await createTempDirAsync("openclaw-source-resolution-");
       const fixture = await createSourcePluginDependenciesFixture(packageRoot);
       const scriptPath = path.join(packageRoot, "scripts", "postinstall-bundled-plugins.mjs");
-      await fs.mkdir(path.dirname(scriptPath), { recursive: true });
+      await fs.mkdir(path.join(packageRoot, "scripts", "lib"), { recursive: true });
       await fs.copyFile(
         fileURLToPath(new URL("../../scripts/postinstall-bundled-plugins.mjs", import.meta.url)),
         scriptPath,
+      );
+      await fs.copyFile(
+        fileURLToPath(new URL("../../scripts/lib/package-lifecycle-marker.mjs", import.meta.url)),
+        path.join(packageRoot, "scripts", "lib", "package-lifecycle-marker.mjs"),
       );
       if (sourceKind === "git checkout") {
         await fs.writeFile(path.join(packageRoot, ".git"), "gitdir: /fixture/worktree\n");
@@ -192,7 +231,7 @@ describe("bundled plugin postinstall", () => {
   });
 
   it.each([undefined, "1"])(
-    "leaves existing operator databases untouched during packaged postinstall (disabled=%s)",
+    "completes packaged lifecycle without changing operator databases (disabled=%s)",
     async (disabled) => {
       const fixtureRoot = await createTempDirAsync("openclaw-postinstall-state-");
       const packageRoot = path.join(fixtureRoot, "node_modules", "openclaw");
@@ -200,6 +239,7 @@ describe("bundled plugin postinstall", () => {
       const stateDir = path.join(home, ".openclaw");
       const databasePath = path.join(stateDir, "state", "openclaw.sqlite");
       const scriptPath = path.join(packageRoot, "scripts", "postinstall-bundled-plugins.mjs");
+      const markerPath = path.join(packageRoot, PACKAGE_LIFECYCLE_PENDING_RELATIVE_PATH);
       const migrationPath = path.join(
         packageRoot,
         "dist",
@@ -208,13 +248,17 @@ describe("bundled plugin postinstall", () => {
         "shared",
         "plugin-registry-migration.js",
       );
-      await fs.mkdir(path.dirname(scriptPath), { recursive: true });
+      await fs.mkdir(path.join(packageRoot, "scripts", "lib"), { recursive: true });
       await fs.mkdir(path.dirname(migrationPath), { recursive: true });
       await fs.mkdir(path.dirname(databasePath), { recursive: true });
       await fs.writeFile(path.join(packageRoot, "package.json"), '{"type":"module"}\n');
       await fs.copyFile(
         fileURLToPath(new URL("../../scripts/postinstall-bundled-plugins.mjs", import.meta.url)),
         scriptPath,
+      );
+      await fs.copyFile(
+        fileURLToPath(new URL("../../scripts/lib/package-lifecycle-marker.mjs", import.meta.url)),
+        path.join(packageRoot, "scripts", "lib", "package-lifecycle-marker.mjs"),
       );
       const database = new DatabaseSync(databasePath);
       try {
@@ -238,6 +282,7 @@ describe("bundled plugin postinstall", () => {
         ].join("\n"),
       );
       await writePackageDistInventory(packageRoot);
+      await fs.writeFile(markerPath, "pending\n");
       const result = spawnSync(process.execPath, [scriptPath], {
         cwd: packageRoot,
         encoding: "utf8",
@@ -252,6 +297,7 @@ describe("bundled plugin postinstall", () => {
         },
       });
       expect(result.status, result.stderr).toBe(0);
+      await expectPathMissing(markerPath);
       expect(await fs.readFile(databasePath)).toEqual(before);
     },
   );

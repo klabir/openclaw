@@ -69,6 +69,8 @@ not a self-contained package artifact. Use `openclaw update --channel dev` to
 switch to the supported checkout and build flow. Other explicit package specs
 keep their package-manager behavior.
 
+After a beta core update, eligible official npm plugins follow the exact installed
+beta version, including one-off `--tag` updates from a stable installation.
 For managed plugins, a missing beta release is a warning, not a failure: the
 core update can still succeed while a plugin falls back to its recorded
 default/latest release.
@@ -239,13 +241,15 @@ openclaw doctor --lint --json
 
 When `openclaw update` manages a global npm install, it installs the target
 into a temporary npm prefix first. The candidate package validates the host
-Node version during `preinstall`; only then does OpenClaw verify the packaged
-`dist` inventory and swap the clean package tree into the real global prefix. A
-packed completion guard is omitted from the expected inventory and removed only
-after `preinstall` succeeds, so skipped lifecycle scripts also fail before the
-swap. The updater probes the owning npm before mutation. On npm 11.15 and
-earlier it omits the unsupported lifecycle-policy flag. On npm 12 and npm
-11.16+, it approves only the candidate OpenClaw lifecycle; transitive
+Node version during `preinstall`; OpenClaw verifies the packaged `dist` inventory
+before swapping the clean package tree into the real global prefix. Pending
+lifecycle work is recorded in `.openclaw-lifecycle-pending` at the package root,
+outside the `dist` inventory. `postinstall` removes that marker after completion.
+If package scripts were skipped, the CLI completes the pending lifecycle before
+running any command, including `--version`; failure stops the command with
+reinstall guidance. The updater probes the owning npm before mutation. On npm
+11.15 and earlier it omits the unsupported lifecycle-policy flag. On npm 12 and
+npm 11.16+, it approves only the candidate OpenClaw lifecycle; transitive
 dependency scripts remain unapproved.
 This avoids npm overlaying a new package onto stale files from the old one. If
 the install command fails, OpenClaw retries once with `--omit=optional`, which
@@ -286,14 +290,16 @@ path applies the same OpenClaw-only Bun trust when it owns the install.
 
 ### Package lifecycle and operator state
 
-Package lifecycle hooks validate the Node runtime and clean only the installed
-package's `dist` tree. Plugin-registry migration and legacy plugin-dependency
-cleanup belong to Doctor, not package installation. `openclaw update` still runs
-Doctor after installing the candidate; after a manual package replacement, run
-`openclaw doctor --fix` before restarting the Gateway.
+Package lifecycle hooks validate the Node runtime and update only package-local
+artifacts: the installed `dist` tree and lifecycle markers. Plugin-registry
+migration and legacy plugin-dependency cleanup belong to Doctor, not package
+installation. `openclaw update` still runs Doctor after installing the candidate;
+after a manual package replacement, run `openclaw doctor --fix` before restarting
+the Gateway.
 
 `OPENCLAW_DISABLE_BUNDLED_PLUGIN_POSTINSTALL=1` skips package-local postinstall
-cleanup. It does not disable Doctor or Gateway startup migrations.
+cleanup, but still completes the lifecycle marker. It does not disable Doctor or
+Gateway startup migrations.
 
 <Warning>
 Older packages, including `2026.8.1`, can migrate the state database during
@@ -307,7 +313,7 @@ different npm prefix alone does not isolate operator state.
 
 <AccordionGroup>
   <Accordion title="Read-only package tree">
-    OpenClaw treats packaged global installs as read-only at runtime, even when the global package directory is writable by the current user. Plugin package installs live in OpenClaw-owned npm/git roots under the user config directory, and Gateway startup does not mutate the OpenClaw package tree.
+    After package lifecycle completion, OpenClaw treats packaged global installs as read-only at runtime, even when the global package directory is writable by the current user. Plugin package installs live in OpenClaw-owned npm/git roots under the user config directory, and Gateway startup does not mutate the OpenClaw package tree.
 
     Some Linux npm setups install global packages under root-owned directories such as `/usr/lib/node_modules/openclaw`. OpenClaw supports that layout because plugin install/update commands write outside that global package directory.
 
