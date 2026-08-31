@@ -10,6 +10,10 @@ import {
 } from "./agent-run-control.js";
 import type { TalkEvent } from "./talk-events.js";
 
+vi.mock("../agents/embedded-agent-runner/runs.js", () => {
+  throw new Error("mutating run commands unavailable");
+});
+
 function createDeps(options: {
   activeSessionId?: string;
   queued?: boolean;
@@ -126,6 +130,16 @@ describe("classifyRealtimeVoiceAgentControlText", () => {
 });
 
 describe("controlRealtimeVoiceAgentRun", () => {
+  it("answers read-only status without the mutating run commands", async () => {
+    await expect(
+      controlRealtimeVoiceAgentRun({
+        sessionKey: "agent:status-probe:main",
+        text: "status",
+        mode: "status",
+      }),
+    ).resolves.toMatchObject({ ok: true, mode: "status", active: false, speak: true });
+  });
+
   it("queues steering into the active embedded run", async () => {
     const deps = createDeps({ activeSessionId: "session-active" });
 

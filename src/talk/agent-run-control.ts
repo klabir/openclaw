@@ -63,23 +63,21 @@ export async function controlRealtimeVoiceAgentRun(
   },
   providedDeps?: RealtimeVoiceAgentControlDeps,
 ): Promise<RealtimeVoiceAgentControlResult> {
-  // Provider registration consumes the shared policy without starting the agent runtime.
-  const deps = providedDeps ?? {
-    ...(await import("../agents/embedded-agent-runner/runs.js")),
-    ...(await import("../agents/embedded-agent-runner/active-run-projections.js")),
-    getDiagnosticSessionActivitySnapshot,
-  };
   const sessionKey = params.sessionKey.trim();
   const text = params.text.trim();
   const intent = resolveRealtimeVoiceAgentControlIntent({ text, mode: params.mode });
   const mode = intent.mode;
-  const sessionId = deps.resolveActiveEmbeddedRunSessionId(sessionKey);
-  const activity = deps.getDiagnosticSessionActivitySnapshot({ sessionId, sessionKey });
-  const active = Boolean(sessionId || activity.activeWorkKind || activity.hasActiveEmbeddedRun);
+  const projections =
+    providedDeps ?? (await import("../agents/embedded-agent-runner/active-run-projections.js"));
+  let sessionId = projections.resolveActiveEmbeddedRunSessionId(sessionKey);
 
-  // Status is read-only and can answer from diagnostic activity even when the
-  // active embedded run id has already disappeared.
+  // Status and inactive-run replies do not need the mutating agent runtime.
+  // Keep them available on a cold Gateway or when action dependencies cannot load.
   if (mode === "status") {
+    const activity = (
+      providedDeps?.getDiagnosticSessionActivitySnapshot ?? getDiagnosticSessionActivitySnapshot
+    )({ sessionId, sessionKey });
+    const active = Boolean(sessionId || activity.activeWorkKind || activity.hasActiveEmbeddedRun);
     return {
       ok: true,
       mode,
@@ -97,24 +95,29 @@ export async function controlRealtimeVoiceAgentRun(
     };
   }
 
-  // Cancellation requires a concrete embedded-run id; activity-only snapshots
-  // are not abortable and should return an explicit no-active-run response.
+  const noActiveRun = (): RealtimeVoiceAgentControlResult => ({
+    ok: false,
+    mode,
+    sessionKey,
+    active: false,
+    ...(mode === "cancel" ? { aborted: false } : { queued: false }),
+    reason: "no_active_run",
+    message: `There is no active OpenClaw run to ${mode === "cancel" ? "cancel" : "steer"}.`,
+    speak: true,
+    show: true,
+    suppress: false,
+  });
+  if (!sessionId) {
+    return noActiveRun();
+  }
+  const commands = providedDeps ?? (await import("../agents/embedded-agent-runner/runs.js"));
+  // Loading commands can outlive the active run; resolve the authoritative target again.
+  sessionId = projections.resolveActiveEmbeddedRunSessionId(sessionKey);
+  if (!sessionId) {
+    return noActiveRun();
+  }
   if (mode === "cancel") {
-    if (!sessionId) {
-      return {
-        ok: false,
-        mode,
-        sessionKey,
-        active: false,
-        aborted: false,
-        reason: "no_active_run",
-        message: "There is no active OpenClaw run to cancel.",
-        speak: true,
-        show: true,
-        suppress: false,
-      };
-    }
-    const aborted = deps.abortEmbeddedAgentRun(sessionId);
+    const aborted = commands.abortEmbeddedAgentRun(sessionId);
     const message = aborted
       ? "Cancelled the active OpenClaw run."
       : "OpenClaw could not cancel the active run.";
@@ -134,25 +137,10 @@ export async function controlRealtimeVoiceAgentRun(
     };
   }
 
-  if (!sessionId) {
-    return {
-      ok: false,
-      mode,
-      sessionKey,
-      active: false,
-      queued: false,
-      reason: "no_active_run",
-      message: "There is no active OpenClaw run to steer.",
-      speak: true,
-      show: true,
-      suppress: false,
-    };
-  }
-
   // Steering and follow-up both enqueue to the active run; follow-up is wrapped
   // so the runner treats it as deferred context instead of an immediate pivot.
   const steerText = mode === "followup" ? buildRealtimeVoiceAgentFollowupSteeringText(text) : text;
-  const outcome = await deps.queueEmbeddedAgentMessageWithOutcomeAsync(sessionId, steerText, {
+  const outcome = await commands.queueEmbeddedAgentMessageWithOutcomeAsync(sessionId, steerText, {
     steeringMode: "all",
     debounceMs: 0,
     isInboundUserMessage: true,
