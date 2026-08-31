@@ -7,6 +7,7 @@ Docs: https://docs.openclaw.ai
 
 ### Changes
 
+- **Cloud worker snapshots:** reclaim images unused for 14 days while their provider remains configured, even with no active workers, without delaying allocation or discarding unresolved cleanup ownership.
 - **Session memory:** capture the departing conversation before manual, daily, or idle resets close its transcript window, preserving recent messages and their trust provenance in memory artifacts.
 - **Secret egress host binding:** bind each shared-store secret to exact HTTPS destination hosts across CLI, Gateway RPC, and Control UI so unbound sentinel substitution fails closed before plaintext egress.
 - **Release validation:** defer beta candidate Parallels smoke to postpublish `release:beta-smoke` by default, keep stable/full prepublish coverage, and bound nested release workflow monitors with explicit job timeouts.
