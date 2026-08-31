@@ -244,6 +244,12 @@ extension OnboardingAISetupModel {
         }
     }
 
+    enum ProviderWizardRequestPhase {
+        case idle
+        case starting
+        case advancing
+    }
+
     var selectedManualProvider: ManualProvider? {
         self.manualProviders.first { $0.id == self.manualProviderID }
     }
@@ -448,6 +454,40 @@ extension OnboardingAISetupModel {
         return Failure(
             summary: self.friendlyTransportError(detail),
             detail: detail.isEmpty ? nil : detail)
+    }
+
+    static func activationWizardResult(
+        status: String?,
+        error: String?,
+        modelActivation: [String: AnyCodable]?,
+        setupActivation: [String: AnyCodable]?) -> Result<ActivateResult, Error>
+    {
+        if status == "done", let setupActivation,
+           let ok = setupActivation["ok"]?.value as? Bool
+        {
+            return .success(ActivateResult(
+                ok: ok,
+                modelRef: setupActivation["modelRef"]?.value as? String,
+                status: setupActivation["status"]?.value as? String,
+                error: setupActivation["error"]?.value as? String,
+                gatewayRestartRequired: setupActivation["gatewayRestartRequired"]?.value as? Bool))
+        }
+        if status == "done",
+           let modelRef = modelActivation?["modelRef"]?.value as? String,
+           !modelRef.isEmpty
+        {
+            return .success(ActivateResult(
+                ok: true,
+                modelRef: modelRef,
+                status: nil,
+                error: nil,
+                gatewayRestartRequired: modelActivation?["gatewayRestartRequired"]?.value as? Bool))
+        }
+        if status == "cancelled" {
+            return .failure(OnboardingAISetupError.activationCancelled)
+        }
+        return .failure(OnboardingAISetupError
+            .activationFailed(error ?? "The Gateway did not return a verified model."))
     }
 
     /// One friendly sentence per failure bucket.
