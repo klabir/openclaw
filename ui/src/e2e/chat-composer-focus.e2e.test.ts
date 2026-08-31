@@ -31,6 +31,11 @@ suite.define(() => {
       await trigger.waitFor({ state: "visible" });
       await trigger.focus();
       await page.keyboard.press("Enter");
+      // Opening assigns focus after animation; earlier navigation can be overwritten.
+      const selectedOption = picker.getByRole("menuitemradio", { name: "main", exact: true });
+      await expect
+        .poll(() => selectedOption.evaluate((element) => document.activeElement === element))
+        .toBe(true);
       await page.keyboard.press("ArrowDown");
       const option = picker.getByRole("menuitemradio", { name: "research", exact: true });
       await expect
@@ -51,6 +56,7 @@ suite.define(() => {
         )
         .toBe(false);
 
+      await option.waitFor({ state: "hidden" });
       await trigger.focus();
       await page.keyboard.press("Enter");
       await expect
