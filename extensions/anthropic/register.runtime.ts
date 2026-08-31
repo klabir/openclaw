@@ -3,6 +3,7 @@
  * CLI auth, dynamic model normalization, usage auth, media, and stream wrappers.
  */
 import { formatCliCommand, parseDurationMs } from "openclaw/plugin-sdk/cli-runtime";
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
 import { resolveExpiresAtMsFromDurationMs } from "openclaw/plugin-sdk/number-runtime";
 import type {
   OpenClawPluginApi,
@@ -17,7 +18,6 @@ import {
   applyAuthProfileConfig,
   type AuthProfileStore,
   buildTokenProfileId,
-  CLAUDE_CLI_PROFILE_ID,
   createProviderApiKeyAuthMethod,
   listProfilesForProvider,
   type OpenClawConfig as ProviderAuthConfig,
@@ -52,12 +52,15 @@ import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coer
 import * as claudeCliAuth from "./cli-auth-seam.js";
 import { buildAnthropicCliBackend } from "./cli-backend.js";
 import { buildClaudeCliCatalogEntries } from "./cli-catalog.js";
-import { CLAUDE_CLI_CANONICAL_DEFAULT_MODEL_REF } from "./cli-constants.js";
+import {
+  CLAUDE_CLI_CANONICAL_DEFAULT_MODEL_REF,
+  CLAUDE_CLI_OFF_THINKING_PROFILE,
+  CLAUDE_CLI_PROFILE_ID,
+} from "./cli-constants.js";
 import { buildAnthropicCliMigrationResult } from "./cli-migration.js";
 import {
   CLAUDE_CLI_BACKEND_ID,
   CLAUDE_CLI_DEFAULT_ALLOWLIST_REFS,
-  CLAUDE_CLI_OFF_THINKING_PROFILE,
   supportsClaudeDynamicSystemPromptSections,
 } from "./cli-shared.js";
 import {
@@ -1177,9 +1180,9 @@ export function buildAnthropicProvider(): ProviderPlugin {
       );
     },
     normalizeResolvedModel: (ctx) => normalizeAnthropicResolvedModel(ctx),
-    resolveSyntheticAuth: ({ provider }) =>
+    resolveSyntheticAuth: ({ config, provider }) =>
       normalizeLowercaseStringOrEmpty(provider) === CLAUDE_CLI_BACKEND_ID
-        ? resolveClaudeCliSyntheticAuth()
+        ? resolveClaudeCliSyntheticAuth(config)
         : undefined,
     // Publish Claude CLI rows through the provider catalog hook.
     augmentModelCatalog: () => buildClaudeCliCatalogEntries(),
@@ -1218,9 +1221,9 @@ export function buildAnthropicProvider(): ProviderPlugin {
 /** Register Anthropic provider, Claude CLI backend, and media understanding provider. */
 export function registerAnthropicPlugin(api: OpenClawPluginApi): void {
   let supportsDynamicSystemPromptSections = false;
-  // Start once at plugin load. The first Claude execution awaits the same promise,
-  // so a post-ready gateway hook cannot race the first session's immutable argv.
-  const dynamicSystemPromptSectionsProbe = (async () => {
+  // Catalog discovery must not materialize the runtime for a CLI-only capability probe.
+  // First CLI executions share and await it before resolving immutable process argv.
+  const ensureDynamicSystemPromptSectionsSupport = createLazyRuntimeModule(async () => {
     try {
       const result = await api.runtime.system.runCommandWithTimeout(["claude", "--version"], {
         timeoutMs: 1_500,
@@ -1232,10 +1235,10 @@ export function registerAnthropicPlugin(api: OpenClawPluginApi): void {
     } catch {
       supportsDynamicSystemPromptSections = false;
     }
-  })();
+  });
   api.registerCliBackend(
     buildAnthropicCliBackend({
-      ensureDynamicSystemPromptSectionsSupport: () => dynamicSystemPromptSectionsProbe,
+      ensureDynamicSystemPromptSectionsSupport,
       supportsDynamicSystemPromptSections: () => supportsDynamicSystemPromptSections,
     }),
   );

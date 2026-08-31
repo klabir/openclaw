@@ -1,0 +1,35 @@
+.chat-attachment-file-icon {
+  position: relative;
+  display: inline-block;
+  flex: none;
+  width: 44px;
+  height: 44px;
+  color: var(--file-icon-glyph);
+  background: var(--chat-file-icon-shell-dark) center / contain no-repeat;
+}
+
+.chat-attachment-file-icon[data-mode="preview-with-favicon"] {
+  width: 20px;
+  height: 20px;
+  background-image: var(--chat-file-icon-compact-dark);
+}
+
+:root[data-theme-mode="light"] .chat-attachment-file-icon {
+  background-image: var(--chat-file-icon-shell-light);
+}
+
+:root[data-theme-mode="light"] .chat-attachment-file-icon[data-mode="preview-with-favicon"] {
+  background-image: var(--chat-file-icon-compact-light);
+}
+
+.chat-attachment-file-icon__overlay {
+  position: absolute;
+  inset: 15px;
+  background-color: var(--chat-file-icon-accent);
+  -webkit-mask: var(--chat-file-icon-overlay) center / 14px 14px no-repeat;
+  mask: var(--chat-file-icon-overlay) center / 14px 14px no-repeat;
+}
+
+.chat-attachment-file-icon--unavailable {
+  opacity: 0.42;
+}

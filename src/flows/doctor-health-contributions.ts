@@ -2,7 +2,7 @@
 // exposing the same checks to structured lint and repair commands.
 import fs from "node:fs";
 import { isDeepStrictEqual } from "node:util";
-import { isGatewayHostServiceEnvironment } from "../infra/gateway-supervision.js";
+import { shouldManageGatewayService } from "../commands/doctor-service-repair-policy.js";
 import { scrubDoctorErrorMessage } from "./doctor-error-message.js";
 import { hasActiveGatewayExecCredential } from "./doctor-gateway-exec-credential.js";
 import {
@@ -61,8 +61,11 @@ async function runGatewayConfigHealth(ctx: DoctorHealthFlowContext): Promise<voi
 }
 
 async function runAuthProfileHealth(ctx: DoctorHealthFlowContext): Promise<void> {
-  const { maybeMigrateAuthProfileJsonStoresToSqlite } =
-    await import("../commands/doctor-auth-flat-profiles.js");
+  const {
+    collectOpenAICodexAuthProfileStoreIdMap,
+    maybeMigrateAuthProfileJsonStoresToSqlite,
+    maybeRepairOpenAICodexAuthConfig,
+  } = await import("../commands/doctor-auth-flat-profiles.js");
   const { maybeRepairLegacyOAuthProfileIds } =
     await import("../commands/doctor-auth-legacy-oauth.js");
   const { maybeRepairLegacyOAuthSidecarProfiles } =
@@ -77,11 +80,23 @@ async function runAuthProfileHealth(ctx: DoctorHealthFlowContext): Promise<void>
     cfg: ctx.cfg,
     prompter: ctx.prompter,
   });
-  await maybeMigrateAuthProfileJsonStoresToSqlite({
+  const openAICodexAuthProfileIdMap = collectOpenAICodexAuthProfileStoreIdMap({
     cfg: ctx.cfg,
-    prompter: ctx.prompter,
     ...(ctx.env ? { env: ctx.env } : {}),
   });
+  const authConfigCandidate = maybeRepairOpenAICodexAuthConfig(ctx.cfg, {
+    profileIdMap: openAICodexAuthProfileIdMap,
+  }).config;
+  const authProfileMigration = await maybeMigrateAuthProfileJsonStoresToSqlite({
+    cfg: authConfigCandidate,
+    prompter: ctx.prompter,
+    openAICodexAuthProfileIdMap,
+    ...(ctx.env ? { env: ctx.env } : {}),
+  });
+  if (authProfileMigration.configOwnerMigrationApplied) {
+    // The candidate is safe only after the migration verifies and archives its source.
+    ctx.cfg = authConfigCandidate;
+  }
   await maybeMigrateLegacyPluginModelCatalogs({
     cfg: ctx.cfg,
     ...(ctx.env ? { env: ctx.env } : {}),
@@ -250,7 +265,7 @@ async function runGatewayAuthHealth(ctx: DoctorHealthFlowContext): Promise<void>
 
 async function runLegacyStateHealth(ctx: DoctorHealthFlowContext): Promise<void> {
   const { detectLegacyStateMigrations, runLegacyStateMigrations } =
-    await import("../commands/doctor-state-migrations.js");
+    await import("../infra/state-migrations.doctor.js");
   const { note } = await loadNoteModule();
   // Settle retired-plugin state cleanup (may replace ctx.cfg) before the
   // legacy-state detect/migrate pair reads the config.
@@ -302,12 +317,18 @@ async function runLegacyStateHealth(ctx: DoctorHealthFlowContext): Promise<void>
   }
 }
 
+async function hasUserScopedSystemdGatewayService(env: NodeJS.ProcessEnv): Promise<boolean> {
+  const { findInstalledSystemdGatewayScope } = await import("../daemon/systemd.js");
+  return (await findInstalledSystemdGatewayScope(env))?.scope === "user";
+}
+
 async function runSystemdLingerHealth(ctx: DoctorHealthFlowContext): Promise<void> {
   if (
     ctx.options.nonInteractive === true ||
     process.platform !== "linux" ||
     resolveDoctorMode(ctx.cfg) !== "local" ||
-    !isGatewayHostServiceEnvironment(ctx.env ?? process.env)
+    !(await shouldManageGatewayService(ctx.env ?? process.env)) ||
+    !(await hasUserScopedSystemdGatewayService(ctx.env ?? process.env))
   ) {
     return;
   }
@@ -337,7 +358,8 @@ async function detectSystemdLingerFindings(
   if (
     process.platform !== "linux" ||
     resolveDoctorMode(ctx.cfg) !== "local" ||
-    !isGatewayHostServiceEnvironment(ctx.env ?? process.env)
+    !(await shouldManageGatewayService(ctx.env ?? process.env)) ||
+    !(await hasUserScopedSystemdGatewayService(ctx.env ?? process.env))
   ) {
     return [];
   }

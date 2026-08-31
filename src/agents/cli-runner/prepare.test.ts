@@ -65,6 +65,11 @@ import {
   buildActiveVideoGenerationTaskPromptContextForSession,
 } from "../media-generation-task-status.js";
 import type { SandboxWorkspaceInfo } from "../sandbox/types.js";
+import { SessionManager } from "../sessions/session-manager.js";
+import {
+  captureRoutingDecisionWork,
+  createModelRoutingTestAdmission,
+} from "../test-helpers/model-routing-decision-e2e-fixtures.js";
 import type { SystemAgentToolOptions } from "../tools/system-agent-tool.js";
 import { prepareClaudeCliSkillsPlugin } from "./claude-skills-plugin.js";
 import { prepareCliRunContext } from "./prepare.js";
@@ -251,6 +256,38 @@ type CliContextBudgetTestCase = {
 
 describe("prepareCliRunContext", () => {
   let fixture: ReturnType<typeof createCliRunnerPrepareFixture>;
+
+  it("preserves outer fallback route provenance through CLI admission", async () => {
+    const runId = "run-cli-model-fallback-receipt";
+    const cfg = { logging: { audit: { executionIdentity: true } } } satisfies OpenClawConfig;
+    const preparedRunAdmission = createModelRoutingTestAdmission({
+      cfg,
+      runId,
+      agentId: "main",
+      boundary: "cli-prepare-test",
+    });
+
+    const { decisionWork } = await captureRoutingDecisionWork(() =>
+      fixture.prepare({
+        runId,
+        config: cfg,
+        preparedRunAdmission,
+        model: "mock-2",
+        modelRoutingProvenance: {
+          requestedProvider: "openai",
+          requestedModel: "mock-1",
+          stage: "fallback",
+          fallbackReason: "rate_limit",
+        },
+      }),
+    ).finally(preparedRunAdmission.close);
+
+    expect(decisionWork).toHaveLength(1);
+    expect(decisionWork[0]?.receipt).toMatchObject({
+      action: { summary: "Requested openai/mock-1; selected test-cli/mock-2." },
+      decision: { reasonCode: "rate_limit" },
+    });
+  });
 
   it.each(["high", "off"] as const)(
     "passes %s thinking through the CLI backend execution seam",
@@ -1630,7 +1667,6 @@ describe("prepareCliRunContext", () => {
     expect(context.claudeSkillsPluginArgs).toEqual([]);
     expect(context.preparedBackend.backend.sessionMode).toBe("none");
     expect(context.preparedBackend.backend.liveSession).toBeUndefined();
-    expect(context.bootstrapPromptWarningLines).toEqual([]);
     expect(context.systemPromptReport.injectedWorkspaceFiles).toEqual([]);
     expect(context.systemPromptReport.tools.entries).toEqual([]);
   });
@@ -1739,6 +1775,110 @@ describe("prepareCliRunContext", () => {
         sessionId: "cli-session",
       });
     }
+  });
+
+  it("routes bootstrap truncation notices into the system prompt, not the turn prompt", async () => {
+    const { dir } = fixture.session;
+    const agentsPath = path.join(dir, "AGENTS.md");
+    setCliRunnerPrepareTestDeps({
+      resolveBootstrapContextForRun: vi.fn(async () => ({
+        bootstrapFiles: [
+          {
+            name: "AGENTS.md" as const,
+            path: agentsPath,
+            content: "policy ".repeat(100),
+            missing: false,
+          },
+        ],
+        contextFiles: [{ path: agentsPath, content: "policy ".repeat(10) }],
+      })),
+    });
+
+    const context = await fixture.prepare({
+      sessionKey: "agent:main:main",
+      config: createCliBackendConfig(),
+      prompt: "Hello",
+      runId: "run-bootstrap-truncation-notice",
+      trigger: "user",
+    });
+
+    expect(context.systemPrompt).toContain("## Bootstrap Context Notice");
+    expect(context.systemPrompt).toContain("[Bootstrap truncation warning]");
+    expect(context.params.prompt).toBe("Hello");
+    expect(context.params.prompt).not.toContain("[Bootstrap truncation warning]");
+    expect(context.systemPromptReport.bootstrapTruncation).toMatchObject({
+      warningShown: true,
+      truncatedFiles: 1,
+    });
+  });
+
+  it("drifts a resumed first-only session when truncation starts mid-session", async () => {
+    const { dir } = fixture.session;
+    const agentsPath = path.join(dir, "AGENTS.md");
+    const bootstrapContextFor = (injected: string) => ({
+      bootstrapFiles: [
+        {
+          name: "AGENTS.md" as const,
+          path: agentsPath,
+          content: "policy ".repeat(100),
+          missing: false,
+        },
+      ],
+      contextFiles: [{ path: agentsPath, content: injected }],
+    });
+    setRawCliBackendForPrepareTest({
+      id: "test-cli",
+      pluginId: "test",
+      bundleMcp: false,
+      nativeToolMode: "always-on",
+      config: {
+        command: "test-cli",
+        args: ["--print"],
+        systemPromptArg: "--system-prompt",
+        systemPromptWhen: "first",
+        sessionMode: "existing",
+        output: "text",
+        input: "arg",
+      },
+    });
+    setCliRunnerPrepareTestDeps({
+      resolveBootstrapContextForRun: vi.fn(async () => bootstrapContextFor("policy ".repeat(100))),
+    });
+    const firstTurn = await fixture.prepare({
+      sessionKey: "agent:main:main",
+      config: createCliBackendConfig(),
+      prompt: "turn one",
+      runId: "run-truncation-drift-1",
+      trigger: "user",
+      extraSystemPrompt: "stable prompt",
+    });
+    expect(firstTurn.systemPrompt).not.toContain("[Bootstrap truncation warning]");
+    const untruncatedBinding = {
+      sessionId: "cli-session",
+      extraSystemPromptHash: firstTurn.extraSystemPromptHash,
+      cwdHash: hashCliSessionText(dir),
+    };
+
+    // AGENTS.md grows past the bootstrap cap between turns of the same session.
+    setCliRunnerPrepareTestDeps({
+      resolveBootstrapContextForRun: vi.fn(async () => bootstrapContextFor("policy ".repeat(10))),
+    });
+    const secondTurn = await fixture.prepare({
+      sessionKey: "agent:main:main",
+      config: createCliBackendConfig(),
+      prompt: "turn two",
+      runId: "run-truncation-drift-2",
+      trigger: "user",
+      extraSystemPrompt: "stable prompt",
+      cliSessionBinding: untruncatedBinding,
+    });
+
+    expect(secondTurn.systemPrompt).toContain("[Bootstrap truncation warning]");
+    expect(secondTurn.reusableCliSession).toEqual({
+      mode: "reuse-with-drift",
+      sessionId: "cli-session",
+      drift: { reasons: ["system-prompt"] },
+    });
   });
 
   it("applies prompt-build hook context to Claude-style CLI preparation", async () => {
@@ -1854,42 +1994,64 @@ describe("prepareCliRunContext", () => {
     expect(hookContext?.channelId).toBe("telegram");
   });
 
-  it("prepends current-turn context after prompt-build hooks without changing hook or transcript prompt", async () => {
-    const hookRunner = {
-      hasHooks: vi.fn((hookName: string) => hookName === "before_prompt_build"),
-      runBeforePromptBuild: vi.fn(async () => ({
-        prependContext: "trusted hook context",
-        appendContext: "trusted hook tail",
-      })),
-    };
-    mockGetGlobalHookRunner.mockReturnValue(hookRunner as never);
+  it.each([false, true])(
+    "preserves prompt privacy and order with plugin execution %s",
+    async (pluginExecution) => {
+      if (pluginExecution) {
+        setCliBackendForPrepareTest({
+          id: "test-cli",
+          bundleMcp: false,
+          prepareExecution: () => ({
+            async *execute() {
+              yield { type: "result" };
+            },
+          }),
+        });
+      }
+      const hookRunner = {
+        hasHooks: vi.fn((hookName: string) => hookName === "before_prompt_build"),
+        runBeforePromptBuild: vi.fn(async () => ({
+          prependContext: "trusted hook context",
+          appendContext: "trusted hook tail",
+        })),
+      };
+      mockGetGlobalHookRunner.mockReturnValue(hookRunner as never);
 
-    // Current inbound metadata is untrusted channel context. It should shape
-    // the CLI prompt without contaminating transcript or hook inputs.
-    const context = await fixture.prepare({
-      sessionKey: "agent:main:test",
-      agentId: "main",
-      trigger: "user",
-      transcriptPrompt: "latest ask",
-      currentInboundContext: {
-        text: "Sender: ⟦openclaw:ctx⟧\nsender_id=U123",
-        promptJoiner: " ",
-      },
-      runId: "run-test-context",
-    });
+      // Current inbound metadata is untrusted channel context. It should shape
+      // the CLI prompt without contaminating transcript or hook inputs.
+      const context = await fixture.prepare({
+        sessionKey: "agent:main:test",
+        agentId: "main",
+        trigger: "user",
+        transcriptPrompt: "latest ask",
+        currentInboundContext: {
+          text: "Sender: ⟦openclaw:ctx⟧\nsender_id=U123",
+          promptJoiner: " ",
+        },
+        runId: "run-test-context",
+      });
 
-    expect(context.params.prompt).toBe(
-      "Sender: ⟦openclaw:ctx⟧\nsender_id=U123 trusted hook context\n\nlatest ask\n\ntrusted hook tail",
-    );
-    expect(context.params.transcriptPrompt).toBe("latest ask");
-    expect(context.contextEngineTurnPrompt).toBe("latest ask");
-    expect(hookRunner.runBeforePromptBuild).toHaveBeenCalledTimes(1);
-    const beforePromptBuildCalls = hookRunner.runBeforePromptBuild.mock.calls as unknown as Array<
-      [unknown, unknown]
-    >;
-    const promptBuildParams = beforePromptBuildCalls[0]?.[0] as { prompt?: string } | undefined;
-    expect(promptBuildParams?.prompt).toBe("latest ask");
-  });
+      const logicalPrompt =
+        "Sender: ⟦openclaw:ctx⟧\nsender_id=U123 trusted hook context\n\nlatest ask\n\ntrusted hook tail";
+      expect(context.params.prompt).toBe(
+        pluginExecution ? "Sender: ⟦openclaw:ctx⟧\nsender_id=U123 latest ask" : logicalPrompt,
+      );
+      expect(context.promptContext).toEqual(
+        pluginExecution
+          ? { prependContext: "trusted hook context", appendContext: "trusted hook tail" }
+          : undefined,
+      );
+      expect(context.promptForHooks).toBe(pluginExecution ? logicalPrompt : undefined);
+      expect(context.params.transcriptPrompt).toBe("latest ask");
+      expect(context.contextEngineTurnPrompt).toBe("latest ask");
+      expect(hookRunner.runBeforePromptBuild).toHaveBeenCalledTimes(1);
+      const beforePromptBuildCalls = hookRunner.runBeforePromptBuild.mock.calls as unknown as Array<
+        [unknown, unknown]
+      >;
+      const promptBuildParams = beforePromptBuildCalls[0]?.[0] as { prompt?: string } | undefined;
+      expect(promptBuildParams?.prompt).toBe("latest ask");
+    },
+  );
 
   it("uses compact current-turn context when a room event resumes a CLI session", async () => {
     fixture.appendTranscript({
@@ -2367,6 +2529,20 @@ describe("prepareCliRunContext", () => {
       });
 
       expect(context.systemPrompt).toContain(SHARED_CHAT_MESSAGE_TOOL_ETIQUETTE);
+    },
+  );
+
+  it.each([undefined, "user", "cron", "heartbeat"] as const)(
+    "keeps heartbeat scheduler instructions out of CLI system prompts: %s",
+    async (trigger) => {
+      const context = await fixture.prepare({
+        config: { agents: { defaults: { heartbeat: { every: "30m" } } } },
+        sessionKey: "agent:main:main",
+        trigger,
+      });
+
+      expect(context.systemPrompt).not.toContain("## Heartbeats");
+      expect(context.systemPrompt).not.toContain("Heartbeat poll;");
     },
   );
 
@@ -3141,8 +3317,6 @@ describe("prepareCliRunContext", () => {
       runId: "run-test-room-event-tools",
       sessionEntry: {
         execHost: "node",
-        execSecurity: "allowlist",
-        execAsk: "on-miss",
         execNode: "mac-a",
       } as never,
       execOverrides: {
@@ -3200,7 +3374,7 @@ describe("prepareCliRunContext", () => {
         workspaceDir: context.workspaceDir,
         modelProvider: "anthropic",
         modelId: "test-model",
-        messageProvider: "discord",
+        messageProvider: "telegram",
         clientCaps: ["tool-events", "inline-widgets"],
         currentChannelId: "telegram:-100123:topic:42",
         currentThreadTs: "42",
@@ -3215,8 +3389,6 @@ describe("prepareCliRunContext", () => {
         nodeExecAllowed: true,
         execSession: {
           execHost: "node",
-          execSecurity: "allowlist",
-          execAsk: "on-miss",
           execNode: "mac-a",
         },
         execOverrides: {
@@ -3306,7 +3478,7 @@ describe("prepareCliRunContext", () => {
         senderName: "Canonical Name",
         senderUsername: "canonical-user",
         senderE164: "+15551234567",
-        messageProvider: "discord",
+        messageProvider: "telegram",
         groupId: "chat123",
         groupChannel: "ops",
         groupSpace: "workspace-a",
@@ -3995,7 +4167,7 @@ describe("prepareCliRunContext", () => {
   });
 
   it("serves only the openclaw MCP server for ring-zero runs", async () => {
-    const { dir, sessionFile } = fixture.session;
+    const { dir, sessionFile, sessionTarget } = fixture.session;
     const getActiveMcpLoopbackRuntime = vi.fn(() => undefined);
     const resolveExecutionArgs = vi.fn(
       (context: {
@@ -4033,6 +4205,7 @@ describe("prepareCliRunContext", () => {
       admittedRunContext: createTestAdmittedRunContext("run-test-openclaw-mcp"),
       sessionId: "session-test",
       sessionFile,
+      sessionTarget,
       workspaceDir: dir,
       prompt: "latest ask",
       provider: "claude-cli",
@@ -4799,18 +4972,22 @@ describe("prepareCliRunContext", () => {
       expectsTruncation: true,
     },
   ])("$name", async (testCase) => {
-    const { sessionFile } = fixture.session;
+    const { dir, sessionTarget } = fixture.session;
     if (testCase.provider === "claude-cli") {
       setCliBackendForPrepareTest({ modelAliases: testCase.modelAliases });
     }
-    fs.appendFileSync(
-      sessionFile,
-      `${JSON.stringify({
-        type: "compaction",
-        summary: `${testCase.marker} ${"x".repeat(testCase.padding)}`,
-      })}\n`,
-      "utf-8",
+    const manager = SessionManager.open(sessionTarget, dir);
+    const firstKeptEntryId = manager.appendMessage({
+      role: "user",
+      content: "RESEED_RETAINED_PREFIX",
+      timestamp: 1,
+    });
+    manager.appendCompaction(
+      `${testCase.marker} ${"x".repeat(testCase.padding)}`,
+      firstKeptEntryId,
+      100_000,
     );
+    manager.flushPendingPersistence();
 
     const context = await fixture.prepare({
       provider: testCase.provider,
@@ -4818,6 +4995,7 @@ describe("prepareCliRunContext", () => {
     });
 
     expect(context.openClawHistoryPrompt).toBeDefined();
+    expect(context.openClawHistoryPrompt).toContain("RESEED_RETAINED_PREFIX");
     if (testCase.expectsTruncation) {
       expect(context.openClawHistoryPrompt).toContain("OpenClaw reseed history truncated");
     } else {
